@@ -170,7 +170,4 @@ This backend acts as:
 
 ---
 
-## Author
 
-Moustafa Omar
-Backend Developer
