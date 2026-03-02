@@ -21,9 +21,10 @@ import java.util.Map;
 public class TranscriptService {
 
     private final TranscriptRepository transcriptRepository;
-    private final MeetingRepository meetingRepository;
-    private final FirefliesApiService firefliesApiService;
-    private final ObjectMapper objectMapper;
+    private final MeetingRepository    meetingRepository;
+    private final FirefliesApiService  firefliesApiService;
+    private final LlmSummaryService    llmSummaryService;       // ← NEW
+    private final ObjectMapper         objectMapper;
 
     // ── GET by meeting ID (cached → API fallback) ─────────────────────────────
 
@@ -37,25 +38,18 @@ public class TranscriptService {
             throw new SecurityException("Unauthorized");
         }
 
-        // Return cached transcript if already saved by webhook or prior fetch
         return transcriptRepository.findByMeetingId(meetingId)
                 .map(existing -> {
 
-
-                    if (existing.getSummary() == null
-                            || existing.getSummary().isBlank()) {
-
-                        log.info("Summary missing — refreshing from Fireflies");
-
-                        log.info("Summary missing — skip API refresh");
-                        return mapToResponse(existing);                    }
+                    // If transcript exists but has no AI summary yet — generate it now
+                    if (existing.getSummary() == null || existing.getSummary().isBlank()) {
+                        log.info("Transcript exists but has no summary — generating AI summary");
+                        return fetchAndSaveFromApi(meeting);
+                    }
 
                     return mapToResponse(existing);
                 })
-                .orElseGet(() -> {
-                    log.info("Transcript not cached yet — waiting for webhook");
-                    return null;
-                });
+                .orElseGet(() -> fetchAndSaveFromApi(meeting));
     }
 
     // ── Fetch from Fireflies API (manual / fallback) ──────────────────────────
@@ -64,9 +58,24 @@ public class TranscriptService {
     @SuppressWarnings("unchecked")
     public TranscriptResponse fetchAndSaveFromApi(Meeting meeting) {
 
-        // Idempotent — return cached if already exists
         return transcriptRepository.findByMeetingId(meeting.getId())
-                .map(this::mapToResponse)
+                .map(existing -> {
+
+                    // Transcript in DB but no AI summary — regenerate
+                    if (existing.getSummary() == null || existing.getSummary().isBlank()) {
+                        log.info("Regenerating AI summary for existing transcript, meeting={}",
+                                meeting.getId());
+                        String aiSummary = llmSummaryService.summarize(
+                                existing.getContent(), meeting.getTitle());
+                        if (aiSummary != null) {
+                            existing.setSummary(aiSummary);
+                            transcriptRepository.save(existing);
+                            log.info("AI summary saved for meeting {}", meeting.getId());
+                        }
+                    }
+
+                    return mapToResponse(existing);
+                })
                 .orElseGet(() -> {
 
                     String transcriptId = meeting.getFirefliesMeetingId();
@@ -80,57 +89,55 @@ public class TranscriptService {
                     Map<String, Object> response = firefliesApiService.getTranscript(transcriptId);
 
                     if (response == null || !response.containsKey("data")) {
-                        throw new RuntimeException("No transcript data returned from Fireflies API");
+                        throw new RuntimeException(
+                                "No transcript data returned from Fireflies API");
                     }
 
                     Map<String, Object> data = (Map<String, Object>) response.get("data");
-                    Map<String, Object> transcriptData = (Map<String, Object>) data.get("transcript");
+                    Map<String, Object> transcriptData =
+                            (Map<String, Object>) data.get("transcript");
 
                     if (transcriptData == null) {
-                        log.info("Transcript not ready yet from Fireflies");
-                        return null;
+                        throw new RuntimeException(
+                                "Transcript not ready yet for ID: " + transcriptId
+                                        + ". Fireflies may still be processing.");
                     }
 
                     try {
                         return buildAndSaveFromWebhook(meeting, transcriptData);
                     } catch (Exception e) {
-                        throw new RuntimeException("Failed to save transcript: " + e.getMessage(), e);
+                        throw new RuntimeException(
+                                "Failed to save transcript: " + e.getMessage(), e);
                     }
                 });
     }
 
     // ── Called by WebhookService after fetching full transcript data ──────────
 
-    /**
-     * Builds a Transcript entity from Fireflies API transcript data map and saves it.
-     * Idempotent — skips if transcript already exists for this meeting.
-     *
-     * @param meeting        the local meeting entity
-     * @param transcriptData the "transcript" node from Fireflies GraphQL response
-     */
     @Transactional
     @SuppressWarnings("unchecked")
     public TranscriptResponse buildAndSaveFromWebhook(Meeting meeting,
                                                       Map<String, Object> transcriptData)
             throws Exception {
 
-        // Idempotent guard
+        // Idempotent guard — skip if already saved
         return transcriptRepository.findByMeetingId(meeting.getId())
                 .map(existing -> {
-                    log.info("Transcript already exists for meeting {} — skipping save", meeting.getId());
+                    log.info("Transcript already exists for meeting {} — skipping save",
+                            meeting.getId());
                     return mapToResponse(existing);
                 })
                 .orElseGet(() -> {
 
-                    // ── Build full-text content from sentences ────────────────────
+                    // ── Build full-text content from sentences ────────────────
                     List<Map<String, Object>> sentences =
                             (List<Map<String, Object>>) transcriptData.get("sentences");
 
                     StringBuilder content = new StringBuilder();
                     if (sentences != null) {
                         for (Map<String, Object> sentence : sentences) {
-                            String speaker = (String) sentence.get("speaker_name");
-                            String text = (String) sentence.get("text");
+                            String speaker   = (String) sentence.get("speaker_name");
+                            String text      = (String) sentence.get("text");
                             Object startTime = sentence.get("start_time");
                             if (speaker != null && text != null) {
                                 if (startTime != null) {
@@ -141,17 +148,16 @@ public class TranscriptService {
                         }
                     }
 
-                    // ── Extract summary fields ────────────────────────────────────
-                    String summaryText = null;
-                    String actionItemsText = null;
-                    String keywordsText = null;
-                    String bulletPoints = null;
+                    // ── Extract Fireflies summary (fallback if LLM fails) ─────
+                    String firefliesSummary  = null;
+                    String actionItemsText   = null;
+                    String keywordsText      = null;
+                    String bulletPoints      = null;
 
                     Object summaryObj = transcriptData.get("summary");
                     if (summaryObj instanceof Map<?, ?> summaryMap) {
-                        summaryText = (String) summaryMap.get("overview");
+                        firefliesSummary = (String) summaryMap.get("overview");
 
-                        // action_items: String or List
                         Object ai = summaryMap.get("action_items");
                         if (ai instanceof List<?> aiList) {
                             actionItemsText = String.join("\n", aiList.stream()
@@ -160,7 +166,6 @@ public class TranscriptService {
                             actionItemsText = aiStr;
                         }
 
-                        // keywords
                         Object kw = summaryMap.get("keywords");
                         if (kw instanceof List<?> kwList) {
                             keywordsText = String.join(", ", kwList.stream()
@@ -169,7 +174,6 @@ public class TranscriptService {
                             keywordsText = kwStr;
                         }
 
-                        // shorthand_bullet
                         Object bullet = summaryMap.get("shorthand_bullet");
                         if (bullet instanceof List<?> bList) {
                             bulletPoints = String.join("\n", bList.stream()
@@ -179,19 +183,19 @@ public class TranscriptService {
                         }
                     }
 
-                    // ── Build enriched summary ────────────────────────────────────
-                    StringBuilder enrichedSummary = new StringBuilder();
-                    if (summaryText != null) {
-                        enrichedSummary.append("## Overview\n").append(summaryText).append("\n\n");
+                    // ── Build Fireflies fallback summary ──────────────────────
+                    StringBuilder firefliesFallback = new StringBuilder();
+                    if (firefliesSummary != null) {
+                        firefliesFallback.append("## Overview\n").append(firefliesSummary).append("\n\n");
                     }
                     if (keywordsText != null) {
-                        enrichedSummary.append("## Keywords\n").append(keywordsText).append("\n\n");
+                        firefliesFallback.append("## Keywords\n").append(keywordsText).append("\n\n");
                     }
                     if (bulletPoints != null) {
-                        enrichedSummary.append("## Key Points\n").append(bulletPoints).append("\n");
+                        firefliesFallback.append("## Key Points\n").append(bulletPoints).append("\n");
                     }
 
-                    // ── Speaker labels JSON ───────────────────────────────────────
+                    // ── Speaker labels JSON ───────────────────────────────────
                     String speakerLabelsJson;
                     try {
                         speakerLabelsJson = sentences != null
@@ -202,14 +206,31 @@ public class TranscriptService {
                         log.warn("Could not serialize speaker labels: {}", e.getMessage());
                     }
 
-                    // ── Persist ───────────────────────────────────────────────────
+                    // ── Call Gemini AI for summary ────────────────────────────
+                    String finalSummary = null;
+                    String contentStr   = content.toString();
+
+                    if (!contentStr.isBlank()) {
+                        log.info("Calling Gemini AI for transcript summary, meeting={}",
+                                meeting.getId());
+                        finalSummary = llmSummaryService.summarize(contentStr, meeting.getTitle());
+                    }
+
+                    // Fallback: use Fireflies summary if Gemini fails/not configured
+                    if (finalSummary == null || finalSummary.isBlank()) {
+                        log.info("Using Fireflies summary as fallback for meeting {}",
+                                meeting.getId());
+                        finalSummary = firefliesFallback.length() > 0
+                                ? firefliesFallback.toString()
+                                : firefliesSummary;
+                    }
+
+                    // ── Persist transcript ────────────────────────────────────
                     Transcript transcript = Transcript.builder()
                             .meeting(meeting)
                             .firefliesTranscriptId((String) transcriptData.get("id"))
-                            .content(content.toString())
-                            .summary(enrichedSummary.length() > 0
-                                    ? enrichedSummary.toString()
-                                    : summaryText)
+                            .content(contentStr)
+                            .summary(finalSummary)                  // ← AI summary here
                             .actionItems(actionItemsText)
                             .speakerLabels(speakerLabelsJson)
                             .processedAt(LocalDateTime.now())
@@ -221,8 +242,9 @@ public class TranscriptService {
                     meeting.setStatus(Meeting.MeetingStatus.COMPLETED);
                     meetingRepository.save(meeting);
 
-                    log.info("Transcript saved for meeting {} (Fireflies transcript ID: {})",
-                            meeting.getId(), transcriptData.get("id"));
+                    log.info("Transcript saved for meeting {} with {} summary",
+                            meeting.getId(),
+                            finalSummary != null ? "AI-generated" : "no");
 
                     return mapToResponse(saved);
                 });
@@ -232,9 +254,9 @@ public class TranscriptService {
 
     private String formatTime(Object timeObj) {
         try {
-            double secs = Double.parseDouble(timeObj.toString());
-            int minutes = (int) (secs / 60);
-            int seconds = (int) (secs % 60);
+            double secs    = Double.parseDouble(timeObj.toString());
+            int    minutes = (int) (secs / 60);
+            int    seconds = (int) (secs % 60);
             return String.format("%02d:%02d", minutes, seconds);
         } catch (Exception e) {
             return timeObj.toString();
