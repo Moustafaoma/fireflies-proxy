@@ -26,7 +26,7 @@ public class TranscriptService {
     private final LlmSummaryService    llmSummaryService;       // ← NEW
     private final ObjectMapper         objectMapper;
 
-    // ── GET by meeting ID (cached → API fallback) ─────────────────────────────
+    // ── GET by meeting ID (cached → API fallback) ff ─────────────────────────────
 
     @Transactional
     public TranscriptResponse getTranscriptByMeetingId(String userEmail, Long meetingId) {
